@@ -17,7 +17,7 @@ cred = credentials.Certificate("firebase-key.json")
 # ✅ Firebase 초기화 (이미 초기화된 경우 예외 방지)
 try:
     firebase_admin.initialize_app(cred, {
-        'storageBucket': 'dinoshuno-mos-app.appspot.com'
+        'storageBucket': 'dinoshuno-mos-app.firebasestorage.app'
     })
 except ValueError:
     pass
