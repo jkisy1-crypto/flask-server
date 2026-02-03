@@ -1,9 +1,8 @@
 import os
-import io
 import json
 import time
-import zipfile
 import hashlib
+import zipfile
 from datetime import datetime, timezone
 
 from flask import Flask, jsonify, request
@@ -13,278 +12,237 @@ from firebase_admin import credentials, storage
 
 
 # =========================
-# Flask
+# Config
 # =========================
+DEFAULT_BUCKET = os.getenv("FIREBASE_BUCKET", "").strip()
+GOOGLE_APPLICATION_CREDENTIALS = os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "").strip()
+
+# 보안/안정 설정
+DISABLE_TRAIN = os.getenv("DISABLE_TRAIN", "0") == "1"     # 응급 차단용
+TRAIN_TOKEN = os.getenv("TRAIN_TOKEN", "").strip()         # 토큰 없으면 제한적으로라도 방어
+TRAIN_MIN_INTERVAL = int(os.getenv("TRAIN_MIN_INTERVAL", "30"))  # 최소 호출 간격(초)
+
+# Storage 경로
+TRAINING_DATA_PREFIX = os.getenv("TRAINING_DATA_PREFIX", "training_data")
+TRAIN_REQUEST_PATH = os.getenv("TRAIN_REQUEST_PATH", f"{TRAINING_DATA_PREFIX}/train_request.json")
+ZIP_PATH = os.getenv("ZIP_PATH", f"{TRAINING_DATA_PREFIX}/data.zip")
+
+# zip 만들 대상 폴더
+IMAGES_PREFIX = os.getenv("IMAGES_PREFIX", f"{TRAINING_DATA_PREFIX}/images")
+LABELS_PREFIX = os.getenv("LABELS_PREFIX", f"{TRAINING_DATA_PREFIX}/labels")
+
+
 app = Flask(__name__)
 
+firebase_inited = False
+last_train_ts = 0
 
-# =========================
-# Firebase init (Secret Files)
-# =========================
-firebase_app = None
+
+def utc_now_iso():
+    return datetime.now(timezone.utc).isoformat()
+
 
 def init_firebase():
     """
-    Render Secret Files:
-      /etc/secrets/firebase-key.json
-    Render Env:
-      FIREBASE_KEY_PATH=/etc/secrets/firebase-key.json
-      FIREBASE_STORAGE_BUCKET=dinoshuno-mos-app.firebasestorage.app
+    - Render Secret Files: /etc/secrets/firebase-key.json
+    - env: GOOGLE_APPLICATION_CREDENTIALS=/etc/secrets/firebase-key.json
     """
-    global firebase_app
-    if firebase_app:
-        return firebase_app
+    global firebase_inited
+    if firebase_inited:
+        return
 
-    key_path = os.getenv("FIREBASE_KEY_PATH", "/etc/secrets/firebase-key.json")
-    bucket_name = os.getenv("FIREBASE_STORAGE_BUCKET")
+    if not DEFAULT_BUCKET:
+        raise RuntimeError("FIREBASE_BUCKET env is missing")
 
-    if not bucket_name:
-        raise ValueError("FIREBASE_STORAGE_BUCKET env missing")
+    # 1) GOOGLE_APPLICATION_CREDENTIALS가 file path면 그걸 사용
+    if GOOGLE_APPLICATION_CREDENTIALS:
+        if not os.path.exists(GOOGLE_APPLICATION_CREDENTIALS):
+            raise RuntimeError(f"GOOGLE_APPLICATION_CREDENTIALS file not found: {GOOGLE_APPLICATION_CREDENTIALS}")
+        cred = credentials.Certificate(GOOGLE_APPLICATION_CREDENTIALS)
+        firebase_admin.initialize_app(cred, {"storageBucket": DEFAULT_BUCKET})
+        firebase_inited = True
+        return
 
-    if not os.path.exists(key_path):
-        raise FileNotFoundError(f"Firebase key file not found: {key_path}")
+    # 2) fallback: Secret File 경로 고정
+    secret_path = "/etc/secrets/firebase-key.json"
+    if os.path.exists(secret_path):
+        cred = credentials.Certificate(secret_path)
+        firebase_admin.initialize_app(cred, {"storageBucket": DEFAULT_BUCKET})
+        firebase_inited = True
+        return
 
-    cred = credentials.Certificate(key_path)
-    firebase_app = firebase_admin.initialize_app(cred, {"storageBucket": bucket_name})
-    return firebase_app
+    raise RuntimeError("Firebase key not found. Set GOOGLE_APPLICATION_CREDENTIALS or upload secret file.")
+
 
 def get_bucket():
     init_firebase()
     return storage.bucket()
 
 
+def sha256_bytes(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def require_train_token():
+    """
+    토큰이 설정되어 있으면 반드시 token 일치해야 함.
+    (없으면 완전 오픈인데, 최소 레이트리밋은 적용)
+    """
+    if not TRAIN_TOKEN:
+        return True
+
+    token = request.args.get("token") or request.headers.get("X-TRAIN-TOKEN")
+    return token == TRAIN_TOKEN
+
+
+def rate_limit_train():
+    global last_train_ts
+    now = time.time()
+    if now - last_train_ts < TRAIN_MIN_INTERVAL:
+        return False, int(TRAIN_MIN_INTERVAL - (now - last_train_ts))
+    last_train_ts = now
+    return True, 0
+
+
+def list_blobs(bucket, prefix: str):
+    return list(bucket.list_blobs(prefix=prefix))
+
+
+def build_zip_from_storage(bucket, images_prefix: str, labels_prefix: str, out_zip_local: str):
+    """
+    Render에서 너무 무거운 학습을 하지 않기 위해:
+    - images, labels 파일을 zip으로만 묶는다.
+    - 이 과정도 최대한 가볍게.
+    """
+    os.makedirs(os.path.dirname(out_zip_local), exist_ok=True)
+
+    image_blobs = list_blobs(bucket, images_prefix)
+    label_blobs = list_blobs(bucket, labels_prefix)
+
+    # 최소 방어: 데이터가 너무 많으면 Render free에서 죽을 수 있음
+    max_files = int(os.getenv("ZIP_MAX_FILES", "5000"))
+    if len(image_blobs) + len(label_blobs) > max_files:
+        raise RuntimeError(f"Too many files for zip on Render: {len(image_blobs)+len(label_blobs)} > {max_files}")
+
+    with zipfile.ZipFile(out_zip_local, "w", compression=zipfile.ZIP_DEFLATED) as z:
+        # images
+        for b in image_blobs:
+            if b.name.endswith("/"):
+                continue
+            data = b.download_as_bytes()
+            arc = b.name.replace(images_prefix + "/", "images/")
+            z.writestr(arc, data)
+
+        # labels
+        for b in label_blobs:
+            if b.name.endswith("/"):
+                continue
+            data = b.download_as_bytes()
+            arc = b.name.replace(labels_prefix + "/", "labels/")
+            z.writestr(arc, data)
+
+
 # =========================
-# Utils
+# Routes
 # =========================
-def now_utc_iso():
-    return datetime.now(timezone.utc).isoformat()
-
-def sha256_bytes(b: bytes) -> str:
-    return hashlib.sha256(b).hexdigest()
-
-def put_json(bucket, path: str, obj: dict):
-    blob = bucket.blob(path)
-    blob.upload_from_string(
-        json.dumps(obj, ensure_ascii=False, indent=2),
-        content_type="application/json"
-    )
-
-def list_blobs_safe(bucket, prefix: str, max_results: int = 20):
-    blobs = bucket.list_blobs(prefix=prefix, max_results=max_results)
-    return [b.name for b in blobs]
-
-def download_blob_bytes(bucket, blob_path: str) -> bytes:
-    blob = bucket.blob(blob_path)
-    return blob.download_as_bytes()
-
-def blob_exists(bucket, blob_path: str) -> bool:
-    return bucket.blob(blob_path).exists()
+@app.get("/")
+def root():
+    return "DinoShuno Flask 서버 정상 작동", 200
 
 
-# =========================
-# Basic Routes
-# =========================
-@app.route("/", methods=["GET", "HEAD"])
-def index():
-    # 기존대로 메인페이지는 간단한 정상 문구
-    return "✅ DinoShuno Flask 서버 정상 작동", 200
-
-@app.route("/health", methods=["GET", "HEAD"])
+@app.get("/health")
 def health():
-    # UptimeRobot은 여기를 치게 권장
-    return jsonify({
-        "status": "ok",
-        "time": now_utc_iso()
-    }), 200
+    # 가장 가벼운 엔드포인트
+    return jsonify({"status": "ok", "time": utc_now_iso()}), 200
 
-@app.route("/firebase_test", methods=["GET"])
+
+@app.get("/firebase_test")
 def firebase_test():
     """
-    Firebase Storage 연결 확인.
-    training_data/ 아래 파일을 일부 나열.
+    bucket 접속 가능한지 + 폴더 구조 확인
     """
     try:
         bucket = get_bucket()
-        files = list_blobs_safe(bucket, prefix="training_data/", max_results=30)
-        return jsonify({
-            "ok": True,
-            "bucket": bucket.name,
-            "count": len(files),
-            "sample_files": files
-        }), 200
+        blobs = bucket.list_blobs(prefix=TRAINING_DATA_PREFIX)
+        sample = []
+        count = 0
+        for b in blobs:
+            count += 1
+            if len(sample) < 10:
+                sample.append(b.name)
+        return jsonify({"ok": True, "bucket": DEFAULT_BUCKET, "count": count, "sample_files": sample}), 200
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
 
 
-# =========================
-# Lock (prevent concurrent train)
-# =========================
-LOCK_BLOB = "training_data/train.lock"
-
-def acquire_lock(bucket, ttl_seconds: int = 600) -> bool:
-    """
-    Firebase Storage에 lock 파일을 두고 동시 실행 방지.
-    ttl_seconds 지나면 stale lock으로 간주하고 덮어씀.
-    """
-    try:
-        blob = bucket.blob(LOCK_BLOB)
-        if blob.exists():
-            data = blob.download_as_text()
-            try:
-                lock_info = json.loads(data)
-                ts = lock_info.get("ts", 0)
-                if time.time() - ts < ttl_seconds:
-                    return False
-            except:
-                # 파싱 실패면 stale로 간주
-                pass
-
-        put_json(bucket, LOCK_BLOB, {"ts": time.time(), "time": now_utc_iso()})
-        return True
-    except:
-        return False
-
-def release_lock(bucket):
-    try:
-        blob = bucket.blob(LOCK_BLOB)
-        if blob.exists():
-            blob.delete()
-    except:
-        pass
-
-
-# =========================
-# Create data.zip (images+labels)
-# =========================
-def build_training_zip_from_storage(bucket,
-                                   images_prefix="training_data/images/",
-                                   labels_prefix="training_data/labels/",
-                                   max_files=3000) -> bytes:
-    """
-    Render에서 학습은 하지 않는다.
-    대신 images/labels를 모아서 data.zip 생성해서 Firebase에 업로드.
-    """
-    images = list(bucket.list_blobs(prefix=images_prefix, max_results=max_files))
-    labels = list(bucket.list_blobs(prefix=labels_prefix, max_results=max_files))
-
-    # 파일명->blob 매핑
-    label_map = {}
-    for b in labels:
-        name = b.name.split("/")[-1]
-        label_map[name] = b
-
-    mem = io.BytesIO()
-    with zipfile.ZipFile(mem, "w", zipfile.ZIP_DEFLATED) as z:
-        added = 0
-        skipped = 0
-
-        for img_blob in images:
-            img_name = img_blob.name.split("/")[-1]
-            if not img_name:
-                continue
-
-            base = os.path.splitext(img_name)[0]
-            label_name = base + ".txt"
-            if label_name not in label_map:
-                skipped += 1
-                continue
-
-            # 다운로드
-            img_bytes = img_blob.download_as_bytes()
-            label_bytes = label_map[label_name].download_as_bytes()
-
-            # zip 내부 경로 (dataset 구조는 네 훈련코드가 맞춰서 사용)
-            z.writestr(f"images/{img_name}", img_bytes)
-            z.writestr(f"labels/{label_name}", label_bytes)
-            added += 1
-
-        # 메타정보
-        meta = {
-            "created_at": now_utc_iso(),
-            "images_prefix": images_prefix,
-            "labels_prefix": labels_prefix,
-            "added_pairs": added,
-            "skipped_no_label": skipped
-        }
-        z.writestr("meta.json", json.dumps(meta, ensure_ascii=False, indent=2))
-
-    mem.seek(0)
-    return mem.read()
-
-
-# =========================
-# /train : job trigger
-# =========================
-@app.route("/train", methods=["POST", "GET"])
+@app.route("/train", methods=["GET", "POST"])
 def train():
     """
-    Android -> https://www.dinoshuno.com/train 호출
-
-    여기서는 "학습 실행"이 아니라:
-      1) 동시실행 방지 lock
-      2) training_data/images + labels -> data.zip 생성
-      3) storage training_data/data.zip 업로드
-      4) training_data/train_request.json 업로드 (데스크탑 GPU 에이전트가 이걸 보고 학습 수행)
+    중요:
+    - Render에서는 학습 절대 하지 않는다.
+    - data.zip 생성 + train_request.json 업데이트만 한다.
+    - desktop trainer가 train_request.json 보고 GPU 학습함.
     """
-    bucket = None
     try:
+        # --- 0) 즉시 차단 옵션 ---
+        if DISABLE_TRAIN:
+            return jsonify({"ok": False, "error": "train disabled temporarily"}), 403
+
+        # --- 1) 토큰 체크 ---
+        if not require_train_token():
+            return jsonify({"ok": False, "error": "unauthorized (token required)"}), 401
+
+        # --- 2) 레이트 리밋 ---
+        ok, wait_sec = rate_limit_train()
+        if not ok:
+            return jsonify({"ok": False, "error": f"rate limited, wait {wait_sec}s"}), 429
+
+        # --- 3) 호출자 정보 로그 (폭격 범인 추적용) ---
+        ip = request.headers.get("X-Forwarded-For", request.remote_addr)
+        ua = request.headers.get("User-Agent", "")
+        app.logger.warning(f"[TRAIN] called ip={ip} ua={ua}")
+
         bucket = get_bucket()
 
-        if not acquire_lock(bucket):
-            return jsonify({"ok": False, "status": "locked"}), 429
+        # --- 4) zip 생성 ---
+        work_dir = "/tmp/mosquito_train"
+        os.makedirs(work_dir, exist_ok=True)
 
-        # zip 생성
-        zip_bytes = build_training_zip_from_storage(bucket)
+        zip_local = os.path.join(work_dir, "data.zip")
+        build_zip_from_storage(bucket, IMAGES_PREFIX, LABELS_PREFIX, zip_local)
 
-        # 업로드
-        zip_path = "training_data/data.zip"
-        blob = bucket.blob(zip_path)
-        blob.upload_from_string(zip_bytes, content_type="application/zip")
+        # --- 5) zip 업로드 ---
+        blob = bucket.blob(ZIP_PATH)
+        blob.upload_from_filename(zip_local, content_type="application/zip")
 
+        # upload 후 다시 bytes로 가져와 hash 계산(정확성 위해)
+        zip_bytes = bucket.blob(ZIP_PATH).download_as_bytes()
         zip_hash = sha256_bytes(zip_bytes)
 
-        # train 요청 기록 (GPU 데스크탑 에이전트가 이거 보고 학습)
+        # --- 6) train_request.json 업데이트 ---
         req = {
-            "requested_at": now_utc_iso(),
-            "zip_path": zip_path,
+            "ok": True,
+            "updated_at": utc_now_iso(),
+            "zip_path": ZIP_PATH,
             "zip_sha256": zip_hash,
-            "bucket": bucket.name,
-            "client_ip": request.headers.get("X-Forwarded-For", request.remote_addr),
-            "note": "Render created data.zip only. Actual training should run on desktop GPU agent."
+            "note": "Render created data.zip only. Training runs on Desktop GPU.",
         }
-        put_json(bucket, "training_data/train_request.json", req)
+        bucket.blob(TRAIN_REQUEST_PATH).upload_from_string(
+            json.dumps(req, ensure_ascii=False, indent=2),
+            content_type="application/json",
+        )
 
         return jsonify({
             "ok": True,
             "message": "data.zip created and train_request.json updated",
-            "zip_path": zip_path,
-            "zip_sha256": zip_hash
+            "zip_path": ZIP_PATH,
+            "zip_sha256": zip_hash,
         }), 200
 
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
 
-    finally:
-        if bucket:
-            release_lock(bucket)
 
-
-# =========================
-# Model metadata endpoint (optional)
-# =========================
-@app.route("/model_metadata", methods=["GET"])
-def model_metadata():
-    """
-    Android 업데이트 매니저가 참고할 메타데이터.
-    (추후 trained_models/metadata.json로 확장)
-    """
-    try:
-        bucket = get_bucket()
-        meta_path = "trained_models/metadata.json"
-        if not blob_exists(bucket, meta_path):
-            return jsonify({"ok": False, "error": "metadata.json not found"}), 404
-
-        data = download_blob_bytes(bucket, meta_path)
-        return app.response_class(data, mimetype="application/json")
-    except Exception as e:
-        return jsonify({"ok": False, "error": str(e)}), 500
+if __name__ == "__main__":
+    # local debug only
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT", "10000")))
